@@ -1,0 +1,200 @@
+import apache_beam as beam
+import pandas as pd
+import numpy as np
+import mysql.connector
+from mysql.connector import Error
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+
+# Stage 1: Data Extraction and Transformation
+# Read the dataset from the URL
+df= pd.read_csv('https://media.githubusercontent.com/media/christiane-villaroel/credit-card-fraud-detection/main/dataset.csv')
+df.to_csv('dataset.csv', index=False,)
+# convert DataFrame to a list of strings to pass to beam readfromtext
+csv_strings = df.to_csv(index=False, header=True).split('\n')
+
+# Sample column definitions based on the CSV file
+column_definitions = {
+    'step': 'INT',
+    'type': 'VARCHAR(255)',
+    'amount': 'FLOAT',
+    'nameOrig': 'VARCHAR(255)',
+    'oldbalanceOrg': 'FLOAT',
+    'newbalanceOrig': 'FLOAT',
+    'nameDest': 'VARCHAR(255)',
+    'oldbalanceDest': 'FLOAT',
+    'newbalanceDest': 'FLOAT',
+    'isFraud': 'INT',
+    'isFlaggedFraud': 'INT'
+}
+# Function to create table query
+def create_table_query(table_name, columns):
+    cols = ",\n".join([f"{col_name} {data_type}" for col_name, data_type in columns.items()])
+    query = f"CREATE TABLE IF NOT EXISTS {table_name} (\n{cols}\n);"
+    return query
+# MySQL 
+config = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': 'Andrewcool318',
+    'database': 'dailytest'
+}
+
+# Connect to MySQL database
+def connect_to_mysql(element):
+  try:
+      connection = mysql.connector.connect(**config)
+      cursor = connection.cursor()
+
+      # Create the table
+      table_name = 'log_data'
+      query = create_table_query(table_name, column_definitions)
+      cursor.execute(query)
+
+      # Insert DataFrame into MySQL table using batch inserts
+      batch_size = 100  # You can adjust this batch size based on your memory capacity and performance
+      for start in range(0, len(element), batch_size):
+          end = start + batch_size
+          batch = df.iloc[start:end]
+
+          insert_query = f"""
+          INSERT INTO {table_name} ({', '.join(column_definitions.keys())})
+          VALUES ({', '.join(['%s'] * len(column_definitions))});
+          """
+
+          cursor.executemany(insert_query, [tuple(row) for row in batch.itertuples(index=False, name=None)])
+
+      connection.commit()
+      cursor.execute("SELECT * FROM log_data")
+      data = cursor.fetchall()
+  except Error as e:
+      print(f"Error: {e}")
+  finally:
+      if 'connection' in locals() and connection.is_connected():
+          cursor.close()
+          connection.close()
+          print("CSV data has been imported into MySQL database successfully.")
+
+
+# Stage 2: Apache Beam Pipeline
+ # creating pipeline
+pipeline = beam.Pipeline()
+
+outputs = (
+    pipeline
+    | 'Read CSV' >> beam.Create(csv_strings)
+    | 'Split CSV' >> beam.Map(lambda s: s.split(','))
+    | 'Dictionary' >> beam.Map(lambda row: dict(zip(column_definitions.keys(), row)))
+    | 'Batch Elements' >> beam.BatchElements(min_batch_size=10,max_batch_size=1000)
+    | 'Write to MYSQL' >> beam.ParDo(connect_to_mysql)
+
+)
+pipeline.run()
+
+# Stage 3: Store in MySQL and Machine Learning
+# Fetch data from MySQL
+try:
+    # Establish connection to MySQL
+    connection = mysql.connector.connect(**config)
+    cursor = connection.cursor()
+    # Example SQL query to fetch data
+    query = "SELECT * FROM log_data LIMIT 6;"  # Adjust your query as needed
+
+    # Execute the query
+    cursor.execute(query)
+
+    # Fetch all rows from the result set
+    table_rows = cursor.fetchall()
+
+    # Creating DataFrame from fetched data
+    df = pd.DataFrame(table_rows, columns=['step', 'type', 'amount', 'nameOrig', 'oldbalanceOrg',
+                                           'newbalanceOrig', 'nameDest', 'oldbalanceDest', 'newbalanceDest',
+                                           'isFraud', 'isFlaggedFraud'])
+
+    # Display or process the DataFrame as needed
+    print(df.head())
+
+except mysql.connector.Error as e:
+    print(f"Error reading data from MySQL: {e}")
+
+finally:
+    # Close cursor and connection
+    if 'connection' in locals() and connection.is_connected():
+        cursor.close()
+        connection.close()
+        print("MySQL connection closed.")
+
+# Analyze the data
+# Display the first few rows of the dataset
+print(df.head())
+
+# Basic data exploration
+print(df.info())
+print(df.describe())
+
+# Check for missing values
+print(df.isnull().sum())
+
+# Encode the 'type' column
+encoder = OneHotEncoder(drop='first', sparse_output=False)
+type_encoded = encoder.fit_transform(df[['type']])
+type_encoded_df = pd.DataFrame(type_encoded, columns=encoder.get_feature_names_out(['type']))
+df = pd.concat([df, type_encoded_df], axis=1)
+df = df.drop('type', axis=1)
+
+# Drop unnecessary columns (if any)
+df = df.drop(columns=['nameOrig', 'nameDest', 'isFlaggedFraud'])
+
+# Define features and target variable
+X = df.drop('isFraud', axis=1)
+y = df['isFraud']
+
+# Split the data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Scale the features
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+# Initialize and train the model
+model = RandomForestClassifier(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+# Make predictions
+y_pred = model.predict(X_test)
+
+# Evaluate the model
+accuracy = accuracy_score(y_test, y_pred)
+conf_matrix = confusion_matrix(y_test, y_pred)
+class_report = classification_report(y_test, y_pred)
+
+print(f'Accuracy: {accuracy}')
+print('Confusion Matrix:')
+print(conf_matrix)
+print('Classification Report:')
+print(class_report)
+
+# Sample dataset
+data = {
+    'is_fraud': [True, False, True, True, False],
+    'person_committed_fraud_before': [True, False, True, False, False],
+    # Add other relevant columns here
+}
+df = pd.DataFrame(data)
+
+# Function to classify fraud risk level
+def classify_fraud_risk(row):
+    if row['is_fraud']:
+        if row['person_committed_fraud_before']:
+            return 'High'
+        else:
+            return 'Medium'
+    return 'Low'
+
+# Apply the function to create a new column
+df['fraud_risk_level'] = df.apply(classify_fraud_risk, axis=1)
+
+print(df)
